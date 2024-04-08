@@ -1,0 +1,16 @@
+[package]
+name = "swap"
+version = "1.0.0"
+#published-at = "0xdf9a156750a94787b8a36a950d5cfb165bc69126495626da46a050fd145b9ce8"
+
+[dependencies]
+Sui = { git = "https://github.com/MystenLabs/sui.git", subdir = "crates/sui-framework/packages/sui-framework", rev = "devnet" }
+# Sui = { local = "../sui/crates/sui-framework/packages/sui-framework" }
+
+[addresses]
+# Note: replace real swap address for test_coins
+swap = "0x0"
+
+# TODO: replace controller and beneficiary on mainnet
+controller = "0x0"
+beneficiary = "0xd4575fae90c78ad3b781f4d686bab3c16b089f03e2b4f5c932b18fda481a335d"
