@@ -141,6 +141,41 @@ module swap::interface {
         )
     }
 
+    public entry fun swap_in<X, Y>(
+        global: &mut Global,
+        coin_out: Coin<Y>,
+        coin_in_max: u64,
+        ctx: &mut TxContext
+    ) {
+        assert!(!implements::is_emergency(global), ERR_EMERGENCY);
+        let is_order = implements::is_order<X, Y>();
+
+        let return_values = implements::swap_in<X, Y>(
+            global,
+            coin_out,
+            coin_in_max,
+            is_order,
+            ctx
+        );
+
+        let coin_y_out = vector::pop_back(&mut return_values);
+        let coin_y_in = vector::pop_back(&mut return_values);
+        let coin_x_out = vector::pop_back(&mut return_values);
+        let coin_x_in = vector::pop_back(&mut return_values);
+
+        let global = implements::id<X, Y>(global);
+        let lp_name = implements::generate_lp_name<X, Y>();
+
+        swapped_event(
+            global,
+            lp_name,
+            coin_x_in,
+            coin_x_out,
+            coin_y_in,
+            coin_y_out
+        )
+    }
+
     public entry fun multi_add_liquidity<X, Y>(
         global: &mut Global,
         coins_x: vector<Coin<X>>,

@@ -35,22 +35,24 @@ module swap::implements {
     const ERR_OVERLIMIT: u64 = 6;
     /// Amount out less than minimum.
     const ERR_COIN_OUT_NUM_LESS_THAN_EXPECTED_MINIMUM: u64 = 7;
+    /// Amount in less than maximum.
+    const ERR_COIN_IN_NUM_LESS_THAN_EXPECTED_MAXIMUM: u64 = 8;
     /// Liquid not enough.
-    const ERR_LIQUID_NOT_ENOUGH: u64 = 8;
+    const ERR_LIQUID_NOT_ENOUGH: u64 = 9;
     /// Coin X is the same as Coin Y
-    const ERR_THE_SAME_COIN: u64 = 9;
+    const ERR_THE_SAME_COIN: u64 = 10;
     /// Pool X-Y has registered
-    const ERR_POOL_HAS_REGISTERED: u64 = 10;
+    const ERR_POOL_HAS_REGISTERED: u64 = 11;
     /// Pool X-Y not register
-    const ERR_POOL_NOT_REGISTER: u64 = 11;
+    const ERR_POOL_NOT_REGISTER: u64 = 12;
     /// Coin X and Coin Y order
-    const ERR_MUST_BE_ORDER: u64 = 12;
+    const ERR_MUST_BE_ORDER: u64 = 13;
     /// Overflow for u64
-    const ERR_U64_OVERFLOW: u64 = 13;
+    const ERR_U64_OVERFLOW: u64 = 14;
     /// Incorrect swap
-    const ERR_INCORRECT_SWAP: u64 = 14;
+    const ERR_INCORRECT_SWAP: u64 = 15;
     /// Insufficient liquidity
-    const ERR_INSUFFICIENT_LIQUIDITY_MINTED: u64 = 15;
+    const ERR_INSUFFICIENT_LIQUIDITY_MINTED: u64 = 16;
 
     /// Current fee is 0.3%
     const FEE_MULTIPLIER: u64 = 30;
@@ -414,6 +416,110 @@ module swap::implements {
         }
     }
 
+    /// Swap Coin<X> for Coin<Y>
+    /// Returns Coin<Y>
+    public(friend) fun swap_in<X, Y>(
+        global: &mut Global,
+        coin_out: Coin<Y>,
+        coin_in_max: u64,
+        is_order: bool,
+        ctx: &mut TxContext
+    ): vector<u64> {
+        assert!(coin::value<Y>(&coin_out) > 0, ERR_ZERO_AMOUNT);
+
+        if (is_order) {
+            let pool = get_mut_pool<X, Y>(global, is_order);
+            let (coin_x_reserve, coin_y_reserve, _lp) = get_reserves_size(pool);
+            assert!(coin_x_reserve > 0 && coin_y_reserve > 0, ERR_RESERVES_EMPTY);
+            let coin_y_out = coin::value(&coin_out);
+
+            let coin_x_in = get_amount_in(
+                coin_y_out,
+                coin_x_reserve,
+                coin_y_reserve,
+            );
+            assert!(
+                coin_x_in <= coin_in_max,
+                ERR_COIN_IN_NUM_LESS_THAN_EXPECTED_MAXIMUM
+            );
+
+            let coin_x_balance: Coin<X> = coin::take(&mut pool.coin_x, coin_x_in, ctx);
+            balance::join(&mut pool.fee_coin_y, balance::split(&mut coin_y_balance, coin_y_fee));
+            balance::join(&mut pool.coin_x, coin_x_balance);
+            
+            transfer::public_transfer(coin_out, tx_context::sender(ctx));
+
+            // let coin_y_fee = get_fee_to_fundation(coin_y_out);
+            // let coin_in = coin::take(&mut pool.coin_x, coin_x_in, ctx);
+
+            // balance::join(&mut pool.fee_coin_y, balance::split(&mut coin_out, coin_y_fee));
+            // balance::join(&mut pool.coin_y, coin_out);
+
+            // transfer::public_transfer(coin_out, tx_context::sender(ctx));
+
+            // // The division operation truncates the decimal,
+            // // Causing coin_out_value to be less than the calculated value.
+            // // Thus making the actual value of new_reserve_out be more.
+            // // So lp_value is increased.
+            // let (new_reserve_x, new_reserve_y, _lp) = get_reserves_size(pool);
+            // assert_lp_value_is_increased(
+            //     coin_x_reserve,
+            //     coin_y_reserve,
+            //     new_reserve_x,
+            //     new_reserve_y
+            // );
+
+            let return_values = vector::empty<u64>();
+            vector::push_back(&mut return_values, coin_x_in);
+            vector::push_back(&mut return_values, 0);
+            vector::push_back(&mut return_values, 0);
+            vector::push_back(&mut return_values, coin_y_out);
+            return_values
+        } else {
+            let pool = get_mut_pool<Y, X>(global, !is_order);
+            let (coin_x_reserve, coin_y_reserve, _lp) = get_reserves_size(pool);
+            assert!(coin_x_reserve > 0 && coin_y_reserve > 0, ERR_RESERVES_EMPTY);
+            let coin_x_out = coin::value(&coin_out);
+
+            let coin_y_in = get_amount_out(
+                coin_x_out,
+                coin_y_reserve,
+                coin_x_reserve,
+            );
+            assert!(
+                coin_y_in <= coin_in_max,
+                ERR_COIN_OUT_NUM_LESS_THAN_EXPECTED_MINIMUM
+            );
+            
+            let coin_y_fee = get_fee_to_fundation(coin_y_in);
+            let coin_in = coin::take(&mut pool.coin_x, coin_y_in, ctx);
+            
+            balance::join(&mut pool.fee_coin_x, balance::split(&mut coin_in, coin_y_fee));
+            balance::join(&mut pool.coin_x, coin_in);
+
+            transfer::public_transfer(coin_out, tx_context::sender(ctx));
+
+            // // The division operation truncates the decimal,
+            // // Causing coin_out_value to be less than the calculated value.
+            // // Thus making the actual value of new_reserve_out be more.
+            // // So lp_value is increased.
+            // let (new_reserve_x, new_reserve_y, _lp) = get_reserves_size(pool);
+            // assert_lp_value_is_increased(
+            //     coin_x_reserve,
+            //     coin_y_reserve,
+            //     new_reserve_x,
+            //     new_reserve_y
+            // );
+
+            let return_values = vector::empty<u64>();
+            vector::push_back(&mut return_values, 0);
+            vector::push_back(&mut return_values, coin_x_out);
+            vector::push_back(&mut return_values, coin_y_in);
+            vector::push_back(&mut return_values, 0);
+            return_values
+        }
+    }
+
     /// Calculate amounts needed for adding new liquidity for both `X` and `Y`.
     /// Returns both `X` and `Y` coins amounts.
     public fun calc_optimal_coin_values(
@@ -490,6 +596,28 @@ module swap::implements {
             (reserve_out as u128),
             new_reserve_in  // scaled to 1000
         )
+    }
+
+    /// Calculate the output amount minus the fee - 0.3%
+    public fun get_amount_in(
+        coin_out: u64,
+        reserve_in: u64,
+        reserve_out: u64,
+    ): u64 {
+        // k from 0.0001 -> 1000
+        let price_impace_numerator = (1000_000 as u128) * (coin_out as u128);
+        let price_impace_denominator = (1000_000 as u128) * ((reserve_out - coin_out) as u128);
+
+        let k = if (reserve_out > reserve_in) {
+            (reserve_out as u128) / (reserve_in as u128)
+        } else {
+            (reserve_in as u128) / (reserve_out as u128)
+        };
+
+        let coin_in = (coin_out as u128) * k * (2 + (price_impace_numerator / price_impace_denominator) as u128) / 2;
+
+        // add fee to coin in
+        (((2000 as u128) * (coin_in as u128)) / (1997 as u128) as u64) 
     }
 
     public fun assert_lp_value_is_increased(
