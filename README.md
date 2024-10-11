@@ -1,4 +1,4 @@
-# BrownFi Sui
+# BrownFi MOVE
 
 ## cmd for tests
 
