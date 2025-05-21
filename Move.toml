@@ -1,10 +1,11 @@
 [package]
 name = "brownfi_amm"
+edition = "2024.beta" # edition = "legacy" to use legacy (pre-2024) Move
 version = "2.0.0"
 #published-at = "0xdf9a156750a94787b8a36a950d5cfb165bc69126495626da46a050fd145b9ce8"
 
 [dependencies]
-Sui = { git = "https://github.com/MystenLabs/sui.git", subdir = "crates/sui-framework/packages/sui-framework", rev = "testnet" }
+Sui = { git = "https://github.com/MystenLabs/sui.git", subdir = "crates/sui-framework/packages/sui-framework", rev = "framework/testnet" }
 
 [addresses]
 # Note: replace real swap address for test_coins
