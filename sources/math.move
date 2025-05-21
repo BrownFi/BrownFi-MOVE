@@ -1,5 +1,5 @@
 // Copyright 2022 OmniBTC Authors. Licensed under Apache-2.0 License.
-module swap::math {
+module brownfi_amm::math {
 
     const ERR_DIVIDE_BY_ZERO: u64 = 500;
     const ERR_U64_OVERFLOW: u64 = 501;

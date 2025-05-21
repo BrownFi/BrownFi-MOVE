@@ -18,7 +18,7 @@
 /// | - test_lp_name
 /// | - test_order
 /// ```
-module swap::implements_tests {
+module brownfi_amm::implements_tests {
     use std::ascii::into_bytes;
     use std::bcs;
     use std::string::utf8;
@@ -29,8 +29,8 @@ module swap::implements_tests {
     use sui::sui::SUI;
     use sui::test_scenario::{Self, Scenario, next_tx, ctx, end};
 
-    use swap::implements::{Self, LP, Global};
-    use swap::math::{sqrt, mul_to_u128};
+    use brownfi_amm::implements::{Self, LP, Global};
+    use brownfi_amm::math::{sqrt, mul_to_u128};
 
     const XBTC_AMOUNT: u64 = 100000000;
     const USDT_AMOUNT: u64 = 1900000000000;
@@ -142,7 +142,7 @@ module swap::implements_tests {
     }
 
     #[test]
-    #[expected_failure(abort_code = swap::implements::ERR_POOL_FULL)]
+    #[expected_failure(abort_code = brownfi_amm::implements::ERR_POOL_FULL)]
     fun test_add_liquidity_aborts_if_pool_has_full() {
         let scenario = scenario();
         add_liquidity_aborts_if_pool_has_full(&mut scenario);

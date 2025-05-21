@@ -1,5 +1,5 @@
 // Copyright 2022 OmniBTC Authors. Licensed under Apache-2.0 License.
-module swap::interface {
+module brownfi_amm::interface {
     use std::vector;
 
     use sui::coin::{Coin, value, split, destroy_zero};
@@ -7,8 +7,8 @@ module swap::interface {
     use sui::transfer;
     use sui::tx_context::{Self, TxContext};
 
-    use swap::event::{added_event, removed_event, swapped_event};
-    use swap::implements::{Self, Global, LP};
+    use brownfi_amm::event::{added_event, removed_event, swapped_event};
+    use brownfi_amm::implements::{Self, Global, LP};
 
     const ERR_NO_PERMISSIONS: u64 = 101;
     const ERR_EMERGENCY: u64 = 102;

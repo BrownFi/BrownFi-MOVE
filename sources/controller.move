@@ -1,8 +1,8 @@
 // Copyright 2022 OmniBTC Authors. Licensed under Apache-2.0 License.
-module swap::controller {
+module brownfi_amm::controller {
     use sui::tx_context::{Self, TxContext};
 
-    use swap::implements::{Self, Global};
+    use brownfi_amm::implements::{Self, Global};
 
     const ERR_NO_PERMISSIONS: u64 = 201;
     const ERR_ALREADY_PAUSE: u64 = 202;

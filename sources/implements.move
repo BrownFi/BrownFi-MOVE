@@ -1,5 +1,5 @@
 // Copyright 2022 OmniBTC Authors. Licensed under Apache-2.0 License.
-module swap::implements {
+module brownfi_amm::implements {
     use std::ascii::into_bytes;
     use std::string::{Self, String};
     use std::type_name::{get, into_string};
@@ -12,12 +12,12 @@ module swap::implements {
     use sui::transfer;
     use sui::tx_context::{Self, TxContext};
 
-    use swap::comparator;
-    use swap::math;
+    use brownfi_amm::comparator;
+    use brownfi_amm::math;
 
-    friend swap::beneficiary;
-    friend swap::controller;
-    friend swap::interface;
+    friend brownfi_amm::beneficiary;
+    friend brownfi_amm::controller;
+    friend brownfi_amm::interface;
 
     /// For when Coin is zero.
     const ERR_ZERO_AMOUNT: u64 = 0;
@@ -444,8 +444,8 @@ module swap::implements {
             );
 
             let coin_x_balance: Coin<X> = coin::take(&mut pool.coin_x, coin_x_in, ctx);
-            balance::join(&mut pool.fee_coin_y, balance::split(&mut coin_y_balance, coin_y_fee));
-            balance::join(&mut pool.coin_x, coin_x_balance);
+            sui::balance::join(&mut pool.fee_coin_y, balance::split(&mut coin_y_balance, coin_y_fee));
+            sui::balance::join(&mut pool.coin_x, coin_x_balance);
             
             transfer::public_transfer(coin_out, tx_context::sender(ctx));
 
@@ -494,8 +494,8 @@ module swap::implements {
             let coin_y_fee = get_fee_to_fundation(coin_y_in);
             let coin_in = coin::take(&mut pool.coin_x, coin_y_in, ctx);
             
-            balance::join(&mut pool.fee_coin_x, balance::split(&mut coin_in, coin_y_fee));
-            balance::join(&mut pool.coin_x, coin_in);
+            sui::balance::join(&mut pool.fee_coin_x, sui::balance::split(&mut coin_in, coin_y_fee));
+            sui::balance::join(&mut pool.coin_x, coin_in);
 
             transfer::public_transfer(coin_out, tx_context::sender(ctx));
 

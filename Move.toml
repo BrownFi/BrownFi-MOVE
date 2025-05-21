@@ -1,15 +1,14 @@
 [package]
-name = "swap"
-version = "1.0.0"
+name = "brownfi_amm"
+version = "2.0.0"
 #published-at = "0xdf9a156750a94787b8a36a950d5cfb165bc69126495626da46a050fd145b9ce8"
 
 [dependencies]
-Sui = { git = "https://github.com/MystenLabs/sui.git", subdir = "crates/sui-framework/packages/sui-framework", rev = "devnet" }
-# Sui = { local = "../sui/crates/sui-framework/packages/sui-framework" }
+Sui = { git = "https://github.com/MystenLabs/sui.git", subdir = "crates/sui-framework/packages/sui-framework", rev = "testnet" }
 
 [addresses]
 # Note: replace real swap address for test_coins
-swap = "0x0"
+brownfi_amm = "0x0"
 
 # TODO: replace controller and beneficiary on mainnet
 controller = "0x0"

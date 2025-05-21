@@ -10,8 +10,8 @@ module test::faucet {
     use sui::tx_context::{Self, TxContext};
     use sui::vec_set::{Self, VecSet};
 
-    use swap::implements::Global;
-    use swap::interface::add_liquidity;
+    use brownfi_amm::implements::Global;
+    use brownfi_amm::interface::add_liquidity;
     use test::coins::{get_coins, BTC, USDT, ETH, BNB, USDC, DAI};
 
     const ONE_COIN: u64 = 100000000;

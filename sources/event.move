@@ -1,12 +1,12 @@
 // Copyright 2022 OmniBTC Authors. Licensed under Apache-2.0 License.
-module swap::event {
+module brownfi_amm::event {
     use std::string::String;
 
     use sui::event::emit;
     use sui::object::ID;
 
-    friend swap::beneficiary;
-    friend swap::interface;
+    friend brownfi_amm::beneficiary;
+    friend brownfi_amm::interface;
 
     /// Liquidity pool added event.
     struct AddedEvent has copy, drop {
