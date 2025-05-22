@@ -1,739 +1,511 @@
-// Copyright 2022 OmniBTC Authors. Licensed under Apache-2.0 License.
-module brownfi_amm::implements {
-    use std::ascii::into_bytes;
-    use std::string::{Self, String};
-    use std::type_name::{get, into_string};
-    use std::vector;
+module brownfi_amm::swap;
 
-    use sui::bag::{Self, Bag};
-    use sui::balance::{Self, Supply, Balance};
-    use sui::coin::{Self, Coin};
-    use sui::object::{Self, ID, UID};
-    use sui::transfer;
-    use sui::tx_context::{Self, TxContext};
+use std::type_name::{Self, TypeName};
+use sui::balance::{Self, Balance, Supply};
+use sui::coin::{Self, Coin};
+use sui::table::{Self, Table};
+use sui::tx_context::sender;
 
-    use brownfi_amm::comparator;
-    use brownfi_amm::math;
+use brownfi_amm::library;
+use brownfi_amm::math;
+use sui::event;
 
-    friend brownfi_amm::beneficiary;
-    friend brownfi_amm::controller;
-    friend brownfi_amm::interface;
+/// The input amount is zero.
+const EZeroInput: u64 = 0;
+/// Pool pair coin types must be ordered alphabetically (`A` < `B`) and mustn't be equal.
+const EInvalidPair: u64 = 1;
+/// Pool for this pair already exists.
+const EPoolAlreadyExists: u64 = 2;
+/// The pool balance differs from the acceptable.
+const EExcessiveSlippage: u64 = 3;
+/// There's no liquidity in the pool.
+const ENoLiquidity: u64 = 4;
 
-    /// For when Coin is zero.
-    const ERR_ZERO_AMOUNT: u64 = 0;
-    /// For when someone tries to swap in an empty pool.
-    const ERR_RESERVES_EMPTY: u64 = 1;
-    /// For when someone attempts to add more liquidity than u128 Math allows.
-    const ERR_POOL_FULL: u64 = 2;
-    /// Insuficient amount in coin x reserves.
-    const ERR_INSUFFICIENT_COIN_X: u64 = 3;
-    /// Insuficient amount in coin y reserves.
-    const ERR_INSUFFICIENT_COIN_Y: u64 = 4;
-    /// Divide by zero while calling mul_div.
-    const ERR_DIVIDE_BY_ZERO: u64 = 5;
-    /// For when someone add liquidity with invalid parameters.
-    const ERR_OVERLIMIT: u64 = 6;
-    /// Amount out less than minimum.
-    const ERR_COIN_OUT_NUM_LESS_THAN_EXPECTED_MINIMUM: u64 = 7;
-    /// Amount in less than maximum.
-    const ERR_COIN_IN_NUM_LESS_THAN_EXPECTED_MAXIMUM: u64 = 8;
-    /// Liquid not enough.
-    const ERR_LIQUID_NOT_ENOUGH: u64 = 9;
-    /// Coin X is the same as Coin Y
-    const ERR_THE_SAME_COIN: u64 = 10;
-    /// Pool X-Y has registered
-    const ERR_POOL_HAS_REGISTERED: u64 = 11;
-    /// Pool X-Y not register
-    const ERR_POOL_NOT_REGISTER: u64 = 12;
-    /// Coin X and Coin Y order
-    const ERR_MUST_BE_ORDER: u64 = 13;
-    /// Overflow for u64
-    const ERR_U64_OVERFLOW: u64 = 14;
-    /// Incorrect swap
-    const ERR_INCORRECT_SWAP: u64 = 15;
-    /// Insufficient liquidity
-    const ERR_INSUFFICIENT_LIQUIDITY_MINTED: u64 = 16;
+const LP_FEE_BASE: u64 = 10_000;
 
-    /// Current fee is 0.3%
-    const FEE_MULTIPLIER: u64 = 30;
-    /// The integer scaling setting for fees calculation.
-    const FEE_SCALE: u64 = 10000;
-    /// The max value that can be held in one of the Balances of
-    /// a Pool. U64 MAX / FEE_SCALE
-    const MAX_POOL_VALUE: u64 = {
-        18446744073709551615 / 10000
+/*=== Events === */
+public struct PoolCreated has copy, drop {
+    pool_id: ID,
+    a: TypeName,
+    b: TypeName,
+    init_a: u64,
+    init_b: u64,
+    lp_minted: u64,
+}
+
+public struct AddLiquidity has copy, drop {
+    pool_id: ID,
+    a: TypeName,
+    b: TypeName,
+    amount_in_a: u64,
+    amount_in_b: u64,
+    lp_minted: u64,
+}
+
+public struct RemoveLiquidity has copy, drop {
+    pool_id: ID,
+    a: TypeName,
+    b: TypeName,
+    amount_out_a: u64,
+    amount_out_b: u64,
+    lp_burnt: u64,
+}
+
+public struct Swap has copy, drop {
+    pool_id: ID,
+    token_in: TypeName,
+    amount_in: u64,
+    token_out: TypeName,
+    amount_out: u64,
+}
+
+/* === LP witness === */
+public struct LP<phantom A, phantom B> has drop {}
+
+/* === Pool === */
+public struct Pool<phantom A, phantom B> has key {
+    id: UID,
+    balance_a: Balance<A>,
+    balance_b: Balance<B>,
+    lp_supply: Supply<LP<A, B>>,
+    fee_points: u64,
+}
+
+public fun pool_balances<A, B>(pool: &Pool<A, B>): (u64, u64, u64) {
+    (
+        balance::value(&pool.balance_a),
+        balance::value(&pool.balance_b),
+        balance::supply_value(&pool.lp_supply)
+    )
+}
+
+public fun pool_fees<A, B>(pool: &Pool<A, B>): u64 {
+    pool.fee_points
+}
+
+/* === Factory === */
+public struct Factory has key {
+    id: UID,
+    table: Table<PoolItem, bool>,
+}
+
+public struct PoolItem has copy, drop, store  {
+    a: TypeName,
+    b: TypeName
+}
+
+fun add_pool<A, B>(factory: &mut Factory) {
+    let a = type_name::get<A>();
+    let b = type_name::get<B>();
+    assert!(library::sort_names(&a, &b) == 0, EInvalidPair);
+
+    let item = PoolItem{ a, b };
+    assert!(table::contains(&factory.table, item) == false, EPoolAlreadyExists);
+
+    table::add(&mut factory.table, item, true)
+}
+
+    /* === main logic === */
+
+fun init(ctx: &mut TxContext) {
+    let factory = Factory { 
+        id: object::new(ctx),
+        table: table::new(ctx),
     };
-    /// Minimal liquidity.
-    const MINIMAL_LIQUIDITY: u64 = 1000;
-    /// Max u64 value.
-    const U64_MAX: u64 = 18446744073709551615;
+    transfer::share_object(factory);
+}
 
-    /// The Pool token that will be used to mark the pool share
-    /// of a liquidity provider. The parameter `X` and `Y` is for the
-    /// coin held in the pool.
-    struct LP<phantom X, phantom Y> has drop, store {}
+public fun create_pool<A, B>(factory: &mut Factory, init_a: Balance<A>, init_b: Balance<B>, ctx: &mut TxContext): Balance<LP<A, B>> {
+    assert!(balance::value(&init_a) > 0 && balance::value(&init_b) > 0, EZeroInput);
 
-    /// The pool with exchange.
-    struct Pool<phantom X, phantom Y> has store {
-        global: ID,
-        coin_x: Balance<X>,
-        fee_coin_x: Balance<X>,
-        coin_y: Balance<Y>,
-        fee_coin_y: Balance<Y>,
-        lp_supply: Supply<LP<X, Y>>,
-        min_liquidity: Balance<LP<X, Y>>,
-    }
+    add_pool<A, B>(factory);
 
-    /// The global config
-    struct Global has key {
-        id: UID,
-        has_paused: bool,
-        controller: address,
-        beneficiary: address,
-        pools: Bag,
-    }
+    // create pool
+    let mut pool = Pool<A, B> {
+        id: object::new(ctx),
+        balance_a: init_a,
+        balance_b: init_b,
+        lp_supply: balance::create_supply(LP<A, B> {}),
+        fee_points: 30, // 0.3%
+    };
 
-    /// Init global config
-    fun init(ctx: &mut TxContext) {
-        let global = Global {
-            id: object::new(ctx),
-            has_paused: false,
-            controller: @controller,
-            beneficiary: @beneficiary,
-            pools: bag::new(ctx)
-        };
+    // mint initial lp tokens
+    let lp_amount = math::mul_sqrt(balance::value(&pool.balance_a), balance::value(&pool.balance_b));
+    let lp_balance = balance::increase_supply(&mut pool.lp_supply, lp_amount);
 
-        transfer::share_object(global)
-    }
+    event::emit(PoolCreated {
+        pool_id: object::id(&pool),
+        a: type_name::get<A>(),
+        b: type_name::get<B>(),
+        init_a: balance::value(&pool.balance_a),
+        init_b: balance::value(&pool.balance_b),
+        lp_minted: lp_amount
+    });
 
-    public fun global_id<X, Y>(pool: &Pool<X, Y>): ID {
-        pool.global
-    }
+    transfer::share_object(pool);
 
-    public(friend) fun id<X, Y>(global: &Global): ID {
-        object::uid_to_inner(&global.id)
-    }
+    lp_balance
+}
 
-    public(friend) fun get_mut_pool<X, Y>(
-        global: &mut Global,
-        is_order: bool,
-    ): &mut Pool<X, Y> {
-        assert!(is_order, ERR_MUST_BE_ORDER);
+public fun add_liquidity<A, B>(pool: &mut Pool<A, B>, mut input_a: Balance<A>, mut input_b: Balance<B>, min_lp_out: u64): (Balance<A>, Balance<B>, Balance<LP<A, B>>) {
+    assert!(balance::value(&input_a) > 0 && balance::value(&input_b) > 0, EZeroInput);
 
-        let lp_name = generate_lp_name<X, Y>();
-        let has_registered = bag::contains_with_type<String, Pool<X, Y>>(&global.pools, lp_name);
-        assert!(has_registered, ERR_POOL_NOT_REGISTER);
+    // calculate the deposit amounts
+    let input_a_mul_pool_b: u128 = (balance::value(&input_a) as u128) * (balance::value(&pool.balance_b) as u128);
+    let input_b_mul_pool_a: u128 = (balance::value(&input_b) as u128) * (balance::value(&pool.balance_a) as u128);
 
-        bag::borrow_mut<String, Pool<X, Y>>(&mut global.pools, lp_name)
-    }
-
-    public(friend) fun has_registered<X, Y>(
-        global: &Global
-    ): bool {
-        let lp_name = generate_lp_name<X, Y>();
-        bag::contains_with_type<String, Pool<X, Y>>(&global.pools, lp_name)
-    }
-
-    public(friend) fun pause(global: &mut Global) {
-        global.has_paused = true
-    }
-
-    public(friend) fun resume(global: &mut Global) {
-        global.has_paused = false
-    }
-
-    public(friend) fun modify_controller(global: &mut Global, new_controller: address) {
-        global.controller = new_controller
-    }
-
-    public(friend) fun is_emergency(global: &Global): bool {
-        global.has_paused
-    }
-
-    public(friend) fun controller(global: &Global): address {
-        global.controller
-    }
-
-    public(friend) fun beneficiary(global: &Global): address {
-        global.beneficiary
-    }
-
-    public fun generate_lp_name<X, Y>(): String {
-        let lp_name = string::utf8(b"");
-        string::append_utf8(&mut lp_name, b"LP-");
-
-        if (is_order<X, Y>()) {
-            string::append_utf8(&mut lp_name, into_bytes(into_string(get<X>())));
-            string::append_utf8(&mut lp_name, b"-");
-            string::append_utf8(&mut lp_name, into_bytes(into_string(get<Y>())));
-        } else {
-            string::append_utf8(&mut lp_name, into_bytes(into_string(get<Y>())));
-            string::append_utf8(&mut lp_name, b"-");
-            string::append_utf8(&mut lp_name, into_bytes(into_string(get<X>())));
-        };
-
-        lp_name
-    }
-
-    public fun is_order<X, Y>(): bool {
-        let comp = comparator::compare(&get<X>(), &get<Y>());
-        assert!(!comparator::is_equal(&comp), ERR_THE_SAME_COIN);
-
-        if (comparator::is_smaller_than(&comp)) {
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Register pool
-    public(friend) fun register_pool<X, Y>(
-        global: &mut Global,
-        is_order: bool
-    ) {
-        assert!(is_order, ERR_MUST_BE_ORDER);
-
-        let lp_name = generate_lp_name<X, Y>();
-        let has_registered = bag::contains_with_type<String, Pool<X, Y>>(&global.pools, lp_name);
-        assert!(!has_registered, ERR_POOL_HAS_REGISTERED);
-
-        let lp_supply = balance::create_supply(LP<X, Y> {});
-        let new_pool = Pool {
-            global: object::uid_to_inner(&global.id),
-            coin_x: balance::zero<X>(),
-            fee_coin_x: balance::zero<X>(),
-            coin_y: balance::zero<Y>(),
-            fee_coin_y: balance::zero<Y>(),
-            lp_supply,
-            min_liquidity: balance::zero<LP<X, Y>>()
-        };
-        bag::add(&mut global.pools, lp_name, new_pool);
-    }
-
-    /// Add liquidity to the `Pool`. Sender needs to provide both
-    /// `Coin<X>` and `Coin<Y>`, and in exchange he gets `Coin<LP>` -
-    /// liquidity provider tokens.
-    public(friend) fun add_liquidity<X, Y>(
-        pool: &mut Pool<X, Y>,
-        coin_x: Coin<X>,
-        coin_x_min: u64,
-        coin_y: Coin<Y>,
-        coin_y_min: u64,
-        is_order: bool,
-        ctx: &mut TxContext
-    ): (Coin<LP<X, Y>>, vector<u64>) {
-        assert!(is_order, ERR_MUST_BE_ORDER);
-
-        let coin_x_value = coin::value(&coin_x);
-        let coin_y_value = coin::value(&coin_y);
-
-        assert!(coin_x_value > 0 && coin_y_value > 0, ERR_ZERO_AMOUNT);
-
-        let coin_x_balance = coin::into_balance(coin_x);
-        let coin_y_balance = coin::into_balance(coin_y);
-
-        let (coin_x_reserve, coin_y_reserve, lp_supply) = get_reserves_size(pool);
-        let (optimal_coin_x, optimal_coin_y) = calc_optimal_coin_values(
-            coin_x_value,
-            coin_y_value,
-            coin_x_min,
-            coin_y_min,
-            coin_x_reserve,
-            coin_y_reserve
+    let deposit_a: u64;
+    let deposit_b: u64;
+    let lp_to_issue: u64;
+    if (input_a_mul_pool_b > input_b_mul_pool_a) { // input_a / pool_a > input_b / pool_b
+        deposit_b = balance::value(&input_b);
+        // pool_a * deposit_b / pool_b
+        deposit_a = (math::ceil_div_u128(
+            input_b_mul_pool_a,
+            (balance::value(&pool.balance_b) as u128),
+        ) as u64);
+        // deposit_b / pool_b * lp_supply
+        lp_to_issue = math::mul_div(
+            deposit_b,
+            balance::supply_value(&pool.lp_supply),
+            balance::value(&pool.balance_b)
         );
-
-        let provided_liq = if (0 == lp_supply) {
-            let initial_liq = math::sqrt(math::mul_to_u128(optimal_coin_x, optimal_coin_y));
-            assert!(initial_liq > MINIMAL_LIQUIDITY, ERR_LIQUID_NOT_ENOUGH);
-
-            let minimal_liquidity = balance::increase_supply(
-                &mut pool.lp_supply,
-                MINIMAL_LIQUIDITY
-            );
-            balance::join(&mut pool.min_liquidity, minimal_liquidity);
-
-            initial_liq - MINIMAL_LIQUIDITY
-        } else {
-            let x_liq = (lp_supply as u128) * (optimal_coin_x as u128) / (coin_x_reserve as u128);
-            let y_liq = (lp_supply as u128) * (optimal_coin_y as u128) / (coin_y_reserve as u128);
-            if (x_liq < y_liq) {
-                assert!(x_liq < (U64_MAX as u128), ERR_U64_OVERFLOW);
-                (x_liq as u64)
-            } else {
-                assert!(y_liq < (U64_MAX as u128), ERR_U64_OVERFLOW);
-                (y_liq as u64)
-            }
-        };
-        assert!(provided_liq > 0, ERR_INSUFFICIENT_LIQUIDITY_MINTED);
-
-        if (optimal_coin_x < coin_x_value) {
-            transfer::public_transfer(
-                coin::from_balance(balance::split(&mut coin_x_balance, coin_x_value - optimal_coin_x), ctx),
-                tx_context::sender(ctx)
-            )
-        };
-        if (optimal_coin_y < coin_y_value) {
-            transfer::public_transfer(
-                coin::from_balance(balance::split(&mut coin_y_balance, coin_y_value - optimal_coin_y), ctx),
-                tx_context::sender(ctx)
-            )
-        };
-
-        let coin_x_amount = balance::join(&mut pool.coin_x, coin_x_balance);
-        let coin_y_amount = balance::join(&mut pool.coin_y, coin_y_balance);
-
-        assert!(coin_x_amount < MAX_POOL_VALUE, ERR_POOL_FULL);
-        assert!(coin_y_amount < MAX_POOL_VALUE, ERR_POOL_FULL);
-
-        let balance = balance::increase_supply(&mut pool.lp_supply, provided_liq);
-
-        let return_values = vector::empty<u64>();
-        vector::push_back(&mut return_values, coin_x_value);
-        vector::push_back(&mut return_values, coin_y_value);
-        vector::push_back(&mut return_values, provided_liq);
-
-        (coin::from_balance(balance, ctx), return_values)
-    }
-
-    /// Remove liquidity from the `Pool` by burning `Coin<LP>`.
-    /// Returns `Coin<X>` and `Coin<Y>`.
-    public(friend) fun remove_liquidity<X, Y>(
-        pool: &mut Pool<X, Y>,
-        lp_coin: Coin<LP<X, Y>>,
-        is_order: bool,
-        ctx: &mut TxContext
-    ): (Coin<X>, Coin<Y>) {
-        assert!(is_order, ERR_MUST_BE_ORDER);
-
-        let lp_val = coin::value(&lp_coin);
-        assert!(lp_val > 0, ERR_ZERO_AMOUNT);
-
-        let (coin_x_amount, coin_y_amount, lp_supply) = get_reserves_size(pool);
-        let coin_x_out = math::mul_div(coin_x_amount, lp_val, lp_supply);
-        let coin_y_out = math::mul_div(coin_y_amount, lp_val, lp_supply);
-
-        balance::decrease_supply(&mut pool.lp_supply, coin::into_balance(lp_coin));
-
-        (
-            coin::take(&mut pool.coin_x, coin_x_out, ctx),
-            coin::take(&mut pool.coin_y, coin_y_out, ctx)
-        )
-    }
-
-    /// Swap Coin<X> for Coin<Y>
-    /// Returns Coin<Y>
-    public(friend) fun swap_out<X, Y>(
-        global: &mut Global,
-        coin_in: Coin<X>,
-        coin_out_min: u64,
-        is_order: bool,
-        ctx: &mut TxContext
-    ): vector<u64> {
-        assert!(coin::value<X>(&coin_in) > 0, ERR_ZERO_AMOUNT);
-
-        if (is_order) {
-            let pool = get_mut_pool<X, Y>(global, is_order);
-            let (coin_x_reserve, coin_y_reserve, _lp) = get_reserves_size(pool);
-            assert!(coin_x_reserve > 0 && coin_y_reserve > 0, ERR_RESERVES_EMPTY);
-            let coin_x_in = coin::value(&coin_in);
-
-            let coin_x_fee = get_fee_to_fundation(coin_x_in);
-            let coin_y_out = get_amount_out(
-                coin_x_in,
-                coin_x_reserve,
-                coin_y_reserve,
-            );
-            assert!(
-                coin_y_out >= coin_out_min,
-                ERR_COIN_OUT_NUM_LESS_THAN_EXPECTED_MINIMUM
-            );
-
-            let coin_x_balance = coin::into_balance(coin_in);
-            balance::join(&mut pool.fee_coin_x, balance::split(&mut coin_x_balance, coin_x_fee));
-            balance::join(&mut pool.coin_x, coin_x_balance);
-            let coin_out = coin::take(&mut pool.coin_y, coin_y_out, ctx);
-            transfer::public_transfer(coin_out, tx_context::sender(ctx));
-
-            // The division operation truncates the decimal,
-            // Causing coin_out_value to be less than the calculated value.
-            // Thus making the actual value of new_reserve_out be more.
-            // So lp_value is increased.
-            let (new_reserve_x, new_reserve_y, _lp) = get_reserves_size(pool);
-            assert_lp_value_is_increased(
-                coin_x_reserve,
-                coin_y_reserve,
-                new_reserve_x,
-                new_reserve_y
-            );
-
-            let return_values = vector::empty<u64>();
-            vector::push_back(&mut return_values, coin_x_in);
-            vector::push_back(&mut return_values, 0);
-            vector::push_back(&mut return_values, 0);
-            vector::push_back(&mut return_values, coin_y_out);
-            return_values
-        } else {
-            let pool = get_mut_pool<Y, X>(global, !is_order);
-            let (coin_x_reserve, coin_y_reserve, _lp) = get_reserves_size(pool);
-            assert!(coin_x_reserve > 0 && coin_y_reserve > 0, ERR_RESERVES_EMPTY);
-            let coin_y_in = coin::value(&coin_in);
-
-            let coin_y_fee = get_fee_to_fundation(coin_y_in);
-            let coin_x_out = get_amount_out(
-                coin_y_in,
-                coin_y_reserve,
-                coin_x_reserve,
-            );
-            assert!(
-                coin_x_out >= coin_out_min,
-                ERR_COIN_OUT_NUM_LESS_THAN_EXPECTED_MINIMUM
-            );
-
-            let coin_y_balance = coin::into_balance(coin_in);
-            balance::join(&mut pool.fee_coin_y, balance::split(&mut coin_y_balance, coin_y_fee));
-            balance::join(&mut pool.coin_y, coin_y_balance);
-            let coin_out = coin::take(&mut pool.coin_x, coin_x_out, ctx);
-            transfer::public_transfer(coin_out, tx_context::sender(ctx));
-
-            // The division operation truncates the decimal,
-            // Causing coin_out_value to be less than the calculated value.
-            // Thus making the actual value of new_reserve_out be more.
-            // So lp_value is increased.
-            let (new_reserve_x, new_reserve_y, _lp) = get_reserves_size(pool);
-            assert_lp_value_is_increased(
-                coin_x_reserve,
-                coin_y_reserve,
-                new_reserve_x,
-                new_reserve_y
-            );
-
-            let return_values = vector::empty<u64>();
-            vector::push_back(&mut return_values, 0);
-            vector::push_back(&mut return_values, coin_x_out);
-            vector::push_back(&mut return_values, coin_y_in);
-            vector::push_back(&mut return_values, 0);
-            return_values
-        }
-    }
-
-    /// Swap Coin<X> for Coin<Y>
-    /// Returns Coin<Y>
-    public(friend) fun swap_in<X, Y>(
-        global: &mut Global,
-        coin_out: Coin<Y>,
-        coin_in_max: u64,
-        is_order: bool,
-        ctx: &mut TxContext
-    ): vector<u64> {
-        assert!(coin::value<Y>(&coin_out) > 0, ERR_ZERO_AMOUNT);
-
-        if (is_order) {
-            let pool = get_mut_pool<X, Y>(global, is_order);
-            let (coin_x_reserve, coin_y_reserve, _lp) = get_reserves_size(pool);
-            assert!(coin_x_reserve > 0 && coin_y_reserve > 0, ERR_RESERVES_EMPTY);
-            let coin_y_out = coin::value(&coin_out);
-
-            let coin_x_in = get_amount_in(
-                coin_y_out,
-                coin_x_reserve,
-                coin_y_reserve,
-            );
-            assert!(
-                coin_x_in <= coin_in_max,
-                ERR_COIN_IN_NUM_LESS_THAN_EXPECTED_MAXIMUM
-            );
-
-            let coin_x_balance: Coin<X> = coin::take(&mut pool.coin_x, coin_x_in, ctx);
-            sui::balance::join(&mut pool.fee_coin_y, balance::split(&mut coin_y_balance, coin_y_fee));
-            sui::balance::join(&mut pool.coin_x, coin_x_balance);
-            
-            transfer::public_transfer(coin_out, tx_context::sender(ctx));
-
-            // let coin_y_fee = get_fee_to_fundation(coin_y_out);
-            // let coin_in = coin::take(&mut pool.coin_x, coin_x_in, ctx);
-
-            // balance::join(&mut pool.fee_coin_y, balance::split(&mut coin_out, coin_y_fee));
-            // balance::join(&mut pool.coin_y, coin_out);
-
-            // transfer::public_transfer(coin_out, tx_context::sender(ctx));
-
-            // // The division operation truncates the decimal,
-            // // Causing coin_out_value to be less than the calculated value.
-            // // Thus making the actual value of new_reserve_out be more.
-            // // So lp_value is increased.
-            // let (new_reserve_x, new_reserve_y, _lp) = get_reserves_size(pool);
-            // assert_lp_value_is_increased(
-            //     coin_x_reserve,
-            //     coin_y_reserve,
-            //     new_reserve_x,
-            //     new_reserve_y
-            // );
-
-            let return_values = vector::empty<u64>();
-            vector::push_back(&mut return_values, coin_x_in);
-            vector::push_back(&mut return_values, 0);
-            vector::push_back(&mut return_values, 0);
-            vector::push_back(&mut return_values, coin_y_out);
-            return_values
-        } else {
-            let pool = get_mut_pool<Y, X>(global, !is_order);
-            let (coin_x_reserve, coin_y_reserve, _lp) = get_reserves_size(pool);
-            assert!(coin_x_reserve > 0 && coin_y_reserve > 0, ERR_RESERVES_EMPTY);
-            let coin_x_out = coin::value(&coin_out);
-
-            let coin_y_in = get_amount_out(
-                coin_x_out,
-                coin_y_reserve,
-                coin_x_reserve,
-            );
-            assert!(
-                coin_y_in <= coin_in_max,
-                ERR_COIN_OUT_NUM_LESS_THAN_EXPECTED_MINIMUM
-            );
-            
-            let coin_y_fee = get_fee_to_fundation(coin_y_in);
-            let coin_in = coin::take(&mut pool.coin_x, coin_y_in, ctx);
-            
-            sui::balance::join(&mut pool.fee_coin_x, sui::balance::split(&mut coin_in, coin_y_fee));
-            sui::balance::join(&mut pool.coin_x, coin_in);
-
-            transfer::public_transfer(coin_out, tx_context::sender(ctx));
-
-            // // The division operation truncates the decimal,
-            // // Causing coin_out_value to be less than the calculated value.
-            // // Thus making the actual value of new_reserve_out be more.
-            // // So lp_value is increased.
-            // let (new_reserve_x, new_reserve_y, _lp) = get_reserves_size(pool);
-            // assert_lp_value_is_increased(
-            //     coin_x_reserve,
-            //     coin_y_reserve,
-            //     new_reserve_x,
-            //     new_reserve_y
-            // );
-
-            let return_values = vector::empty<u64>();
-            vector::push_back(&mut return_values, 0);
-            vector::push_back(&mut return_values, coin_x_out);
-            vector::push_back(&mut return_values, coin_y_in);
-            vector::push_back(&mut return_values, 0);
-            return_values
-        }
-    }
-
-    /// Calculate amounts needed for adding new liquidity for both `X` and `Y`.
-    /// Returns both `X` and `Y` coins amounts.
-    public fun calc_optimal_coin_values(
-        coin_x_desired: u64,
-        coin_y_desired: u64,
-        coin_x_min: u64,
-        coin_y_min: u64,
-        coin_x_reserve: u64,
-        coin_y_reserve: u64
-    ): (u64, u64) {
-        if (coin_x_reserve == 0 && coin_y_reserve == 0) {
-            return (coin_x_desired, coin_y_desired)
-        } else {
-            let coin_y_returned = math::mul_div(coin_x_desired, coin_y_reserve, coin_x_reserve);
-            if (coin_y_returned <= coin_y_desired) {
-                assert!(coin_y_returned >= coin_y_min, ERR_INSUFFICIENT_COIN_Y);
-                return (coin_x_desired, coin_y_returned)
-            } else {
-                let coin_x_returned = math::mul_div(coin_y_desired, coin_x_reserve, coin_y_reserve);
-                assert!(coin_x_returned <= coin_x_desired, ERR_OVERLIMIT);
-                assert!(coin_x_returned >= coin_x_min, ERR_INSUFFICIENT_COIN_X);
-                return (coin_x_returned, coin_y_desired)
-            }
-        }
-    }
-
-    /// Get most used values in a handy way:
-    /// - amount of Coin<X>
-    /// - amount of Coin<Y>
-    /// - total supply of LP<X,Y>
-    public fun get_reserves_size<X, Y>(pool: &Pool<X, Y>): (u64, u64, u64) {
-        (
-            balance::value(&pool.coin_x),
-            balance::value(&pool.coin_y),
-            balance::supply_value(&pool.lp_supply)
-        )
-    }
-
-    public fun get_fee_amount<X, Y>(pool: &Pool<X, Y>): (u64, u64) {
-        (
-            balance::value(&pool.fee_coin_x),
-            balance::value(&pool.fee_coin_y),
-        )
-    }
-
-    /// return coin_in * 0.3% * 20%
-    public fun get_fee_to_fundation(
-        coin_in: u64,
-    ): u64 {
-        // 20% fee to swap fundation
-        let fee_multiplier = FEE_MULTIPLIER / 5;
-
-        math::mul_div(coin_in, fee_multiplier, FEE_SCALE)
-    }
-
-    /// Calculate the output amount minus the fee - 0.3%
-    public fun get_amount_out(
-        coin_in: u64,
-        reserve_in: u64,
-        reserve_out: u64,
-    ): u64 {
-        let fee_multiplier = FEE_SCALE - FEE_MULTIPLIER;
-
-        let coin_in_val_after_fees = (coin_in as u128) * (fee_multiplier as u128);
-
-        // reserve_in size after adding coin_in (scaled to 1000)
-        let new_reserve_in = ((reserve_in as u128) * (FEE_SCALE as u128))
-            + coin_in_val_after_fees;
-
-        // Multiply coin_in by the current exchange rate:
-        // current_exchange_rate = reserve_out / reserve_in
-        // amount_in_after_fees * current_exchange_rate -> amount_out
-        math::mul_div_u128(coin_in_val_after_fees, // scaled to 1000
-            (reserve_out as u128),
-            new_reserve_in  // scaled to 1000
-        )
-    }
-
-    /// Calculate the output amount minus the fee - 0.3%
-    public fun get_amount_in(
-        coin_out: u64,
-        reserve_in: u64,
-        reserve_out: u64,
-    ): u64 {
-        // k from 0.0001 -> 1000
-        let price_impace_numerator = (1000_000 as u128) * (coin_out as u128);
-        let price_impace_denominator = (1000_000 as u128) * ((reserve_out - coin_out) as u128);
-
-        let k = if (reserve_out > reserve_in) {
-            (reserve_out as u128) / (reserve_in as u128)
-        } else {
-            (reserve_in as u128) / (reserve_out as u128)
-        };
-
-        let coin_in = (coin_out as u128) * k * (2 + (price_impace_numerator / price_impace_denominator) as u128) / 2;
-
-        // add fee to coin in
-        (((2000 as u128) * (coin_in as u128)) / (1997 as u128) as u64) 
-    }
-
-    public fun assert_lp_value_is_increased(
-        old_reserve_x: u64,
-        old_reserve_y: u64,
-        new_reserve_x: u64,
-        new_reserve_y: u64,
-    ) {
-        // never overflow
-        assert!(
-            (old_reserve_x as u128) * (old_reserve_y as u128)
-                < (new_reserve_x as u128) * (new_reserve_y as u128),
-            ERR_INCORRECT_SWAP
-        )
-    }
-
-    /// Withdraw the fee coins
-    public(friend) fun withdraw<X, Y>(
-        pool: &mut Pool<X, Y>,
-        ctx: &mut TxContext
-    ): (Coin<X>, Coin<Y>, u64, u64) {
-        let coin_x_fee = balance::value(&pool.fee_coin_x);
-        let coin_y_fee = balance::value(&pool.fee_coin_y);
-
-        assert!(coin_x_fee > 0 && coin_y_fee > 0, ERR_ZERO_AMOUNT);
-
-        let fee_coin_x = coin::from_balance(
-            balance::split(&mut pool.fee_coin_x, coin_x_fee),
-            ctx
+    } else if (input_a_mul_pool_b < input_b_mul_pool_a) { // input_a / pool_a < input_b / pool_b
+        deposit_a = balance::value(&input_a);
+        // pool_b * deposit_a / pool_a
+        deposit_b = (math::ceil_div_u128(
+            input_a_mul_pool_b,
+            (balance::value(&pool.balance_a) as u128),
+        ) as u64);
+        // deposit_a / pool_a * lp_supply
+        lp_to_issue = math::mul_div(
+            deposit_a,
+            balance::supply_value(&pool.lp_supply),
+            balance::value(&pool.balance_a)
         );
-        let fee_coin_y = coin::from_balance(
-            balance::split(&mut pool.fee_coin_y, coin_y_fee),
-            ctx
-        );
+    } else {
+        deposit_a = balance::value(&input_a);
+        deposit_b = balance::value(&input_b);
+        if (balance::supply_value(&pool.lp_supply) == 0) {
+            // in this case both pool balances are 0 and lp supply is 0
+            lp_to_issue = math::mul_sqrt(deposit_a, deposit_b);
+        } else {
+            // the ratio of input a and b matches the ratio of pool balances
+            lp_to_issue = math::mul_div(
+                deposit_a,
+                balance::supply_value(&pool.lp_supply),
+                balance::value(&pool.balance_a)
+            );
+        }
+    };
 
-        (fee_coin_x, fee_coin_y, coin_x_fee, coin_y_fee)
-    }
+    // deposit amounts into pool 
+    balance::join(
+        &mut pool.balance_a,
+        balance::split(&mut input_a, deposit_a)
+    );
+    balance::join(
+        &mut pool.balance_b,
+        balance::split(&mut input_b, deposit_b)
+    );
 
-    #[test_only]
-    public fun init_for_testing(
-        ctx: &mut TxContext
-    ) {
-        init(ctx)
-    }
+    // mint lp coin
+    assert!(lp_to_issue >= min_lp_out, EExcessiveSlippage);
+    let lp = balance::increase_supply(&mut pool.lp_supply, lp_to_issue);
 
-    #[test_only]
-    public fun add_liquidity_for_testing<X, Y>(
-        global: &mut Global,
-        coin_x: Coin<X>,
-        coin_y: Coin<Y>,
-        ctx: &mut TxContext
-    ): (Coin<LP<X, Y>>, vector<u64>) {
-        let is_order = is_order<X, Y>();
-        if (!has_registered<X, Y>(global)) {
-            register_pool<X, Y>(global, is_order)
-        };
-        let pool = get_mut_pool<X, Y>(global, is_order);
+    event::emit(AddLiquidity {
+        pool_id: object::id(pool),
+        a: type_name::get<A>(),
+        b: type_name::get<B>(),
+        amount_in_a: deposit_a,
+        amount_in_b: deposit_b,
+        lp_minted: lp_to_issue,
+    });
 
-        add_liquidity(
-            pool,
-            coin_x,
-            1,
-            coin_y,
-            1,
-            is_order,
-            ctx
-        )
-    }
+    // return
+    (input_a, input_b, lp)
+}
 
-    #[test_only]
-    public fun get_mut_pool_for_testing<X, Y>(
-        global: &mut Global
-    ): &mut Pool<X, Y> {
-        get_mut_pool<X, Y>(global, is_order<X, Y>())
-    }
+public fun remove_liquidity<A, B>(pool: &mut Pool<A, B>, lp_in: Balance<LP<A, B>>, min_a_out: u64, min_b_out: u64): (Balance<A>, Balance<B>) {
+    assert!(balance::value(&lp_in) > 0, EZeroInput);
 
-    #[test_only]
-    public fun swap_for_testing<X, Y>(
-        global: &mut Global,
-        coin_in: Coin<X>,
-        coin_out_min: u64,
-        ctx: &mut TxContext
-    ): vector<u64> {
-        swap_out<X, Y>(
-            global,
-            coin_in,
-            coin_out_min,
-            is_order<X, Y>(),
-            ctx
-        )
-    }
+    // calculate output amounts
+    let lp_in_amount = balance::value(&lp_in);
+    let pool_a_amount = balance::value(&pool.balance_a);
+    let pool_b_amount = balance::value(&pool.balance_b);
+    let lp_supply = balance::supply_value(&pool.lp_supply);
 
-    #[test_only]
-    public fun remove_liquidity_for_testing<X, Y>(
-        pool: &mut Pool<X, Y>,
-        lp_coin: Coin<LP<X, Y>>,
-        ctx: &mut TxContext
-    ): (Coin<X>, Coin<Y>) {
-        remove_liquidity<X, Y>(
-            pool,
-            lp_coin,
-            is_order<X, Y>(),
-            ctx
-        )
-    }
+    let a_out = math::mul_div(lp_in_amount, pool_a_amount, lp_supply);
+    let b_out = math::mul_div(lp_in_amount, pool_b_amount, lp_supply);
+    assert!(a_out >= min_a_out, EExcessiveSlippage);
+    assert!(b_out >= min_b_out, EExcessiveSlippage);
 
-    #[test_only]
-    public fun withdraw_for_testing<X, Y>(
-        global: &mut Global,
-        ctx: &mut TxContext
-    ): (Coin<X>, Coin<Y>, u64, u64) {
-        let pool = get_mut_pool<X, Y>(global, is_order<X, Y>());
+    // burn lp tokens
+    balance::decrease_supply(&mut pool.lp_supply, lp_in);
 
-        withdraw<X, Y>(
-            pool,
-            ctx
-        )
-    }
+    event::emit(RemoveLiquidity {
+        pool_id: object::id(pool),
+        a: type_name::get<A>(),
+        b: type_name::get<B>(),
+        amount_out_a: a_out,
+        amount_out_b: b_out,
+        lp_burnt: lp_in_amount,
+    });
+
+    // return amounts
+    (
+        balance::split(&mut pool.balance_a, a_out),
+        balance::split(&mut pool.balance_b, b_out)
+    )
+}
+
+public fun swap_a_for_b<A, B>(pool: &mut Pool<A, B>, input: Balance<A>, min_out: u64): Balance<B> {
+    assert!(balance::value(&input) > 0, EZeroInput);
+    assert!(balance::value(&pool.balance_a) > 0 && balance::value(&pool.balance_b) > 0, ENoLiquidity);
+
+    // calculate swap result
+    let input_amount = balance::value(&input);
+    let pool_a_amount = balance::value(&pool.balance_a);
+    let pool_b_amount = balance::value(&pool.balance_b);
+
+    let out_amount = calc_swap_out(input_amount, pool_a_amount, pool_b_amount, pool.fee_points);
+
+    assert!(out_amount >= min_out, EExcessiveSlippage);
+
+    // deposit input
+    balance::join(&mut pool.balance_a, input);
+
+    event::emit(Swap {
+        pool_id: object::id(pool),
+        token_in: type_name::get<A>(),
+        amount_in: input_amount,
+        token_out: type_name::get<B>(),
+        amount_out: out_amount,
+    });
+
+    // return output
+    balance::split(&mut pool.balance_b, out_amount)
+}
+
+public fun swap_b_for_a<A, B>(pool: &mut Pool<A, B>, input: Balance<B>, min_out: u64): Balance<A> {
+    assert!(balance::value(&input) > 0, EZeroInput);
+    assert!(balance::value(&pool.balance_a) > 0 && balance::value(&pool.balance_b) > 0, ENoLiquidity);
+
+    // calculate swap result
+    let input_amount = balance::value(&input);
+    let pool_b_amount = balance::value(&pool.balance_b);
+    let pool_a_amount = balance::value(&pool.balance_a);
+
+    let out_amount = calc_swap_out(input_amount, pool_b_amount, pool_a_amount, pool.fee_points);
+
+    assert!(out_amount >= min_out, EExcessiveSlippage);
+
+    // deposit input
+    balance::join(&mut pool.balance_b, input);
+
+    event::emit(Swap {
+        pool_id: object::id(pool),
+        token_in: type_name::get<B>(),
+        amount_in: input_amount,
+        token_out: type_name::get<A>(),
+        amount_out: out_amount,
+    });
+
+    // return output
+    balance::split(&mut pool.balance_a, out_amount)
+}
+
+/// Calclates swap result and fees based on the input amount and current pool state.
+fun calc_swap_out(input_amount: u64, input_pool_amount: u64, out_pool_amount: u64, fee_points: u64): u64 {
+    // calc out value
+    let fee_amount = math::ceil_mul_div(input_amount, fee_points, LP_FEE_BASE);
+    let input_amount_after_fee = input_amount - fee_amount;
+    // (out_pool_amount - out_amount) * (input_pool_amount + input_amount_after_fee) = out_pool_amount * input_pool_amount
+    // (out_pool_amount - out_amount) / out_pool_amount = input_pool_amount / (input_pool_amount + input_amount_after_fee)
+    // out_amount / out_pool_amount = input_amount_after_fee / (input_pool_amount + input_amount_after_fee)
+    let out_amount = math::mul_div(input_amount_after_fee, out_pool_amount, input_pool_amount + input_amount_after_fee);
+
+    out_amount
+}
+
+/* === with coin === */
+
+fun destroy_zero_or_transfer_balance<T>(balance: Balance<T>, recipient: address, ctx: &mut TxContext) {
+    if (balance::value(&balance) == 0) {
+        balance::destroy_zero(balance);
+    } else {
+        transfer::public_transfer(coin::from_balance(balance, ctx), recipient);
+    };
+}
+
+public fun create_pool_with_coins<A, B>(factory: &mut Factory, init_a: Coin<A>, init_b: Coin<B>, ctx: &mut TxContext): Coin<LP<A, B>> {
+    let lp_balance = create_pool(factory, coin::into_balance(init_a), coin::into_balance(init_b), ctx);
+    
+    coin::from_balance(lp_balance, ctx)
+}
+
+public entry fun create_pool_with_coins_and_transfer_lp_to_sender<A, B>(factory: &mut Factory, init_a: Coin<A>, init_b: Coin<B>, ctx: &mut TxContext) {
+    let lp_balance = create_pool(factory, coin::into_balance(init_a), coin::into_balance(init_b), ctx);
+    transfer::public_transfer(coin::from_balance(lp_balance, ctx), sender(ctx));
+}
+
+public fun add_liquidity_with_coins<A, B>(pool: &mut Pool<A, B>, input_a: Coin<A>, input_b: Coin<B>, min_lp_out: u64, ctx: &mut TxContext): (Coin<A>, Coin<B>, Coin<LP<A, B>>) {
+    let (remaining_a, remaining_b, lp) = add_liquidity(pool, coin::into_balance(input_a), coin::into_balance(input_b), min_lp_out);
+
+    (
+        coin::from_balance(remaining_a, ctx),
+        coin::from_balance(remaining_b, ctx),
+        coin::from_balance(lp, ctx),
+    )
+}
+
+public entry fun add_liquidity_with_coins_and_transfer_to_sender<A, B>(pool: &mut Pool<A, B>, input_a: Coin<A>, input_b: Coin<B>, min_lp_out: u64, ctx: &mut TxContext) {
+    let (remaining_a, remaining_b, lp) = add_liquidity(pool, coin::into_balance(input_a), coin::into_balance(input_b), min_lp_out);
+    let sender = sender(ctx);
+    destroy_zero_or_transfer_balance(remaining_a, sender, ctx);
+    destroy_zero_or_transfer_balance(remaining_b, sender, ctx);
+    destroy_zero_or_transfer_balance(lp, sender, ctx);
+}
+
+public fun remove_liquidity_with_coins<A, B>(pool: &mut Pool<A, B>, lp_in: Coin<LP<A, B>>, min_a_out: u64, min_b_out: u64, ctx: &mut TxContext): (Coin<A>, Coin<B>) {
+    let (a_out, b_out) = remove_liquidity(pool, coin::into_balance(lp_in), min_a_out, min_b_out);
+
+    (
+        coin::from_balance(a_out, ctx),
+        coin::from_balance(b_out, ctx),
+    )
+}
+
+public entry fun remove_liquidity_with_coins_and_transfer_to_sender<A, B>(pool: &mut Pool<A, B>, lp_in: Coin<LP<A, B>>, min_a_out: u64, min_b_out: u64, ctx: &mut TxContext) {
+    let (a_out, b_out) = remove_liquidity(pool, coin::into_balance(lp_in), min_a_out, min_b_out);
+    let sender = sender(ctx);
+    destroy_zero_or_transfer_balance(a_out, sender, ctx);
+    destroy_zero_or_transfer_balance(b_out, sender, ctx);
+}
+
+public fun swap_a_for_b_with_coin<A, B>(pool: &mut Pool<A, B>, input: Coin<A>, min_out: u64, ctx: &mut TxContext): Coin<B> {
+    let b_out = swap_a_for_b(pool, coin::into_balance(input), min_out);
+
+    coin::from_balance(b_out, ctx)
+}
+
+public entry fun swap_a_for_b_with_coin_and_transfer_to_sender<A, B>(pool: &mut Pool<A, B>, input: Coin<A>, min_out: u64, ctx: &mut TxContext) {
+    let b_out = swap_a_for_b(pool, coin::into_balance(input), min_out);
+    transfer::public_transfer(coin::from_balance(b_out, ctx), sender(ctx));
+}
+
+public fun swap_b_for_a_with_coin<A, B>(pool: &mut Pool<A, B>, input: Coin<B>, min_out: u64, ctx: &mut TxContext): Coin<A> {
+    let a_out = swap_b_for_a(pool, coin::into_balance(input), min_out);
+
+    coin::from_balance(a_out, ctx)
+}
+
+public entry fun swap_b_for_a_with_coin_and_transfer_to_sender<A, B>(pool: &mut Pool<A, B>, input: Coin<B>, min_out: u64, ctx: &mut TxContext) {
+    let a_out = swap_b_for_a(pool, coin::into_balance(input), min_out);
+    transfer::public_transfer(coin::from_balance(a_out, ctx), sender(ctx));
+}
+
+/* === test === */
+
+#[test_only]
+public fun test_init(ctx: &mut TxContext) {
+    init(ctx)
+}
+
+#[test_only]
+public struct BAR has drop {}
+#[test_only]
+public struct FOO has drop {}
+#[test_only]
+public struct FOOD has drop {}
+#[test_only]
+public struct FOOd has drop {}
+
+#[test]
+fun test_cmp_type_names() {
+    assert!(library::sort_names(&type_name::get<BAR>(), &type_name::get<FOO>()) == 0, 0);
+    assert!(library::sort_names(&type_name::get<FOO>(), &type_name::get<FOO>()) == 1, 0);
+    assert!(library::sort_names(&type_name::get<FOO>(), &type_name::get<BAR>()) == 2, 0);
+
+    assert!(library::sort_names(&type_name::get<FOO>(), &type_name::get<FOOd>()) == 0, 0);
+    assert!(library::sort_names(&type_name::get<FOOd>(), &type_name::get<FOO>()) == 2, 0);
+
+    assert!(library::sort_names(&type_name::get<FOOD>(), &type_name::get<FOOd>()) == 0, 0);
+    assert!(library::sort_names(&type_name::get<FOOd>(), &type_name::get<FOOD>()) == 2, 0);
+}
+
+#[test_only]
+fun test_destroy_empty_factory(factory: Factory) {
+    let Factory { id, table } = factory;
+    object::delete(id);
+    table::destroy_empty(table);
+}
+
+#[test_only]
+fun test_remove_pool_item<A, B>(factory: &mut Factory) {
+    let a = type_name::get<A>();
+    let b = type_name::get<B>();
+    table::remove(&mut factory.table, PoolItem{ a, b });
+}
+
+#[test]
+fun test_factory() {
+    let ctx = &mut tx_context::dummy();
+    let mut factory = Factory { 
+        id: object::new(ctx),
+        table: table::new(ctx),
+    };
+
+    add_pool<BAR, FOO>(&mut factory);
+    add_pool<FOO, FOOd>(&mut factory);
+
+    test_remove_pool_item<BAR, FOO>(&mut factory);
+    test_remove_pool_item<FOO, FOOd>(&mut factory);
+    test_destroy_empty_factory(factory);
+}
+
+#[test]
+#[expected_failure(abort_code = EInvalidPair)]
+fun test_add_pool_aborts_on_wrong_order() {
+    let ctx = &mut tx_context::dummy();
+    let mut factory = Factory { 
+        id: object::new(ctx),
+        table: table::new(ctx),
+    };
+
+    add_pool<FOO, BAR>(&mut factory);
+
+    test_remove_pool_item<FOO, BAR>(&mut factory);
+    test_destroy_empty_factory(factory);
+}
+
+#[test]
+#[expected_failure(abort_code = EInvalidPair)]
+fun test_add_pool_aborts_on_same_type() {
+    let ctx = &mut tx_context::dummy();
+    let mut factory = Factory { 
+        id: object::new(ctx),
+        table: table::new(ctx),
+    };
+
+    add_pool<FOO, FOO>(&mut factory);
+
+    test_remove_pool_item<FOO, FOO>(&mut factory);
+    test_destroy_empty_factory(factory);
+}
+
+#[test]
+#[expected_failure(abort_code = EPoolAlreadyExists)]
+fun test_add_pool_aborts_on_already_exists() {
+    let ctx = &mut tx_context::dummy();
+    let mut factory = Factory { 
+        id: object::new(ctx),
+        table: table::new(ctx),
+    };
+
+    add_pool<BAR, FOO>(&mut factory);
+    add_pool<BAR, FOO>(&mut factory); // aborts here
+
+    test_remove_pool_item<BAR, FOO>(&mut factory);
+    test_destroy_empty_factory(factory);
 }
