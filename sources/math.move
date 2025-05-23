@@ -1,57 +1,21 @@
-// Copyright 2022 OmniBTC Authors. Licensed under Apache-2.0 License.
-module swap::math {
+module brownfi_amm::math;
 
-    const ERR_DIVIDE_BY_ZERO: u64 = 500;
-    const ERR_U64_OVERFLOW: u64 = 501;
+/// Calculates (a * b) / c. Errors if result doesn't fit into u64.
+public fun mul_div(a: u64, b: u64, c: u64): u64 {
+    ((((a as u128) * (b as u128)) / (c as u128)) as u64)
+}
 
-    const U64_MAX: u64 = 18446744073709551615;
+/// Calculates ceil_div((a * b), c). Errors if result doesn't fit into u64.
+public fun ceil_mul_div(a: u64, b: u64, c: u64): u64 {
+    (ceil_div_u128((a as u128) * (b as u128), (c as u128)) as u64)
+}
 
-    /// Multiple two u64 and get u128, e.g. ((`x` * `y`) as u128).
-    public fun mul_to_u128(x: u64, y: u64): u128 {
-        (x as u128) * (y as u128)
-    }
+/// Calculates sqrt(a * b).
+public fun mul_sqrt(a: u64, b: u64): u64 {
+    (std::u128::sqrt((a as u128) * (b as u128)) as u64)
+}
 
-    /// Get square root of `y`.
-    /// Babylonian method (https://en.wikipedia.org/wiki/Methods_of_computing_square_roots#Babylonian_method)
-    public fun sqrt(y: u128): u64 {
-        if (y < 4) {
-            if (y == 0) {
-                0u64
-            } else {
-                1u64
-            }
-        } else {
-            let z = y;
-            let x = y / 2 + 1;
-            while (x < z) {
-                z = x;
-                x = (y / x + x) / 2;
-            };
-            (z as u64)
-        }
-    }
-
-    /// Implements: `x` * `y` / `z`.
-    public fun mul_div(
-        x: u64,
-        y: u64,
-        z: u64
-    ): u64 {
-        assert!(z != 0, ERR_DIVIDE_BY_ZERO);
-        let r = (x as u128) * (y as u128) / (z as u128);
-        assert!(!(r > (U64_MAX as u128)), ERR_U64_OVERFLOW);
-        (r as u64)
-    }
-
-    /// Implements: `x` * `y` / `z`.
-    public fun mul_div_u128(
-        x: u128,
-        y: u128,
-        z: u128
-    ): u64 {
-        assert!(z != 0, ERR_DIVIDE_BY_ZERO);
-        let r = x * y / z;
-        assert!(!(r > (U64_MAX as u128)), ERR_U64_OVERFLOW);
-        (r as u64)
-    }
+/// Calculates ceil(a / b).
+public fun ceil_div_u128(a: u128, b: u128): u128 {
+    if (a == 0) 0 else (a - 1) / b + 1
 }
